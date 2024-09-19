@@ -893,6 +893,7 @@ class CF3DGS_Render:
                 "viewspace_points": screenspace_points,
                 "visibility_filter": radii > 0,
                 "radii": radii,
+                "means3D": means3D,
             }
         elif len(out) == 3:
             rendered_image, radii, rendered_depth = out

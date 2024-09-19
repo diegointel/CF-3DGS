@@ -821,11 +821,15 @@ class CFGaussianTrainer(GaussianTrainer):
 
         if save_ply:
             points = self.gs_render.gaussians._xyz.detach().cpu().numpy()
+            # Save points to a .npy file
+            npy_filename = filename.replace('.png', '_points.npy')
+            np.save(npy_filename, points)
+
+            # Continue with the original code for saving the point cloud
             pcd_data = o3d.geometry.PointCloud()
             pcd_data.points = o3d.utility.Vector3dVector(points)
             pcd_data.colors = o3d.utility.Vector3dVector(np.ones_like(points))
-            o3d.io.write_point_cloud(
-                filename.replace('.png', '.ply'), pcd_data)
+            o3d.io.write_point_cloud(filename.replace('.png', '.ply'), pcd_data)
 
     
     def construct_point(self, gs_model, poses, iteration, result_path, stop_frame=-1):

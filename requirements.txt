@@ -2,7 +2,7 @@ tqdm==4.65.0
 Pillow
 opencv-python
 imageio
-matplotlib==3.7
+matplotlib==3.7.5
 pyyaml
 plyfile
 kornia

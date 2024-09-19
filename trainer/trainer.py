@@ -37,7 +37,8 @@ import gzip
 import torch
 import torch.nn.functional as F
 torch.hub.help("intel-isl/MiDaS", "DPT_BEiT_L_384", force_reload=True)
-
+import sys
+import os
 
 class GaussianTrainer(object):
 
@@ -111,48 +112,27 @@ class GaussianTrainer(object):
         return R[0].numpy(), t[0].numpy(), FoVx, FoVy, intr_mat[0].numpy()
 
     def setup_depth_predictor(self,):
-        # we recommand to use the following depth models:
-        # - "midas" for the Tank and Temples dataset
-        # - "zoe" for the CO3D dataset
-        # - "depth_anything" for the custom dataset
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        if self.depth_model_type == "zoe":
-            repo = "isl-org/ZoeDepth"
-            model_zoe_n = torch.hub.load(repo, "ZoeD_NK", pretrained=True)
-            zoe = model_zoe_n.to(device)
-            self.depth_model = zoe
-        elif self.depth_model_type == "depth_anything":
-            from torchvision.transforms import Compose
-            from submodules.DepthAnything.depth_anything.dpt import DepthAnything
-            from submodules.DepthAnything.depth_anything.util.transform import Resize, NormalizeImage, PrepareForNet
-            encoder = 'vits' # can also be 'vitb' or 'vitl'
-            depth_anything = DepthAnything.from_pretrained('LiheYoung/depth_anything_{:}14'.format(encoder)).eval()
-            # depth_anything = DepthAnything.from_pretrained('checkpoints/depth_anything_metric_depth_outdoor', local_files_only=True).eval()
-
-            self.depth_transforms = Compose([
-                Resize(
-                    width=518,
-                    height=518,
-                    resize_target=False,
-                    keep_aspect_ratio=True,
-                    ensure_multiple_of=14,
-                    resize_method='lower_bound',
-                    image_interpolation_method=cv2.INTER_CUBIC,
-                ),
-                NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                PrepareForNet(),
-            ])
-            self.depth_model = depth_anything
-        else:
-            midas = torch.hub.load("intel-isl/MiDaS", "DPT_Hybrid")
-            midas.to(device)
-            midas.eval()
-            midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
-            self.depth_transforms = midas_transforms.dpt_transform
-            self.depth_model = midas
         self.mono_depth = OrderedDict()
+        sys.path.append(os.path.abspath('/nfs/site/home/ldgomezr/Depth-Anything-V2'))
+        from depth_anything_v2.dpt import DepthAnythingV2
+        DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+        model_configs = {
+            'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+            'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+            'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+            'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
+        }
+        encoder = 'vits' #, 'vitb', 'vitg'
+        model = DepthAnythingV2(**model_configs[encoder])
+        model.load_state_dict(torch.load(f'/nfs/site/home/ldgomezr/Depth-Anything-V2/depth_anything_v2_vits.pth', map_location='cpu'))
+        model = model.to(DEVICE).eval()
+        self.depth_model = model
+
 
     def predict_depth(self, img):
+        depth = self.depth_model.infer_image(img)
+        depth_tensor = torch.from_numpy(depth).float()
+        return depth_tensor
         if self.depth_model_type == "zoe":
             depth = self.depth_model.infer_pil(Image.fromarray(img.astype(np.uint8)),
                                                output_type='tensor')
@@ -514,10 +494,10 @@ class GaussianTrainer(object):
         return cam_info, pcd, viewpoint_camera
 
     def prepare_custom_data(self, idx, down_sample=True,
-                            orthogonal=True, pose=None,
-                            load_depth=True, **kwargs):
+                        orthogonal=True, pose=None,
+                        load_depth=True, **kwargs):
         image_name = self.data[idx]
-        intrinsics = self.intrinsic
+        intrinsics = self.intrinsic.copy()  # Make a copy of the intrinsics to modify if needed
         uid = idx
 
         original_image = Image.open(image_name).convert("RGB")
@@ -526,9 +506,16 @@ class GaussianTrainer(object):
             original_image = original_image.resize(
                 (width // 2, height // 2), Image.LANCZOS)
             width, height = original_image.size
+
+            # Scale intrinsics after resizing
+            intrinsics[0, 0] /= 2  # Scale focal length x
+            intrinsics[1, 1] /= 2  # Scale focal length y
+            intrinsics[0, 2] /= 2  # Scale principal point x (cx)
+            intrinsics[1, 2] /= 2  # Scale principal point y (cy)
+
         image_np = np.asarray(original_image) / 255.0
-        color_torch = torch.from_numpy(np.asarray(
-            original_image) / 255.0).permute(2, 0, 1).float()
+        color_torch = torch.from_numpy(image_np).permute(2, 0, 1).float()
+        
         if orthogonal:
             R = np.eye(3)
             t = np.zeros(3)
@@ -538,27 +525,24 @@ class GaussianTrainer(object):
         else:
             R = np.eye(3)
             t = np.zeros(3)
-        focal_length_x = self.intrinsic[0, 0]
-        focal_length_y = self.intrinsic[1, 1]
+        
+        focal_length_x = intrinsics[0, 0]
+        focal_length_y = intrinsics[1, 1]
         FoVy = focal2fov(focal_length_y, height)
         FoVx = focal2fov(focal_length_x, width)
 
-        
         cam_info = {}
         pose_src = np.eye(4)
         cam_info["gt_pose"] = copy(pose_src)
         cam_info["intrinsics"] = intrinsics
-
         cam_info["FoVx"] = FoVx
         cam_info["FoVy"] = FoVy
         cam_info["R"] = R
         cam_info["t"] = t
 
-
         if load_depth:
             if idx not in self.mono_depth:
                 depth_tensor = self.predict_depth(np.asarray(original_image))
-                # depth_tensor = self.depth_model.infer_pil(image_pil, output_type='tensor')
                 depth_tensor[depth_tensor < self.near] = self.near
                 self.mono_depth[idx] = depth_tensor.cuda()
             else:
@@ -568,26 +552,34 @@ class GaussianTrainer(object):
             depth_tensor = torch.ones((h, w))
             self.mono_depth[idx] = depth_tensor.cuda()
 
-        intr_mat_tensor = torch.from_numpy(
-            intrinsics).float().to(depth_tensor.device)
+        intr_mat_tensor = torch.from_numpy(intrinsics).float().to(depth_tensor.device)
         pts = depth_to_3d(depth_tensor[None, None],
-                          intr_mat_tensor[None],
-                          normalize_points=False)
+                        intr_mat_tensor[None],
+                        normalize_points=False)
 
         points = pts[0].permute(1, 2, 0).cpu().numpy().reshape(-1, 3)
 
+        # Filter to remove white color
+        white_color = np.array([0.85, 0.85, 0.85])
+        color_mask = np.all(image_np >= white_color, axis=-1)
+
+        
+        points = points[~color_mask.flatten()]
+        colors = image_np.reshape(-1, 3)[~color_mask.flatten()]
+
         viewpoint_camera = Camera(idx, R, t, FoVx, FoVy, color_torch,
                                 gt_alpha_mask=None, image_name=image_name,
-                                intrinsics=self.intrinsic,
+                                intrinsics=intrinsics,
                                 uid=idx, is_co3d=True)
 
         pcd_data = o3d.geometry.PointCloud()
         pcd_data.points = o3d.utility.Vector3dVector(points)
-        pcd_data.colors = o3d.utility.Vector3dVector(image_np.reshape(-1, 3))
+        pcd_data.colors = o3d.utility.Vector3dVector(colors)
         pcd_data.estimate_normals()
+        
         if down_sample:
             voxel_size = 0.01
-            while len(pcd_data.points)> 1_000_000:
+            while len(pcd_data.points) > 1_000_000:
                 pcd_data = pcd_data.voxel_down_sample(voxel_size=voxel_size)
                 voxel_size *= 5
 
@@ -597,7 +589,6 @@ class GaussianTrainer(object):
         pcd = BasicPointCloud(points, colors, normals)
 
         return cam_info, pcd, viewpoint_camera
-
 
     def prepare_data(self, idx, down_sample=True,
                      orthogonal=True, learn_pose=False,
