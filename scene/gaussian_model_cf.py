@@ -677,6 +677,7 @@ class CFGaussianModel:
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
+        print("Densification Gradients:", grads)
         grads[grads.isnan()] = 0.0
 
         self.densify_and_clone(grads, max_grad, extent)
@@ -820,8 +821,9 @@ class CF3DGS_Render:
             sh_degree=self.gaussians.active_sh_degree,
             campos=viewpoint_camera.camera_center,
             prefiltered=False,
-            debug=False,
+            debug=True,
         )
+        # print("Rasterization Parameters:", raster_settings)
 
         rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 

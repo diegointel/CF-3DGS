@@ -51,5 +51,8 @@ if __name__ == "__main__":
         trainer.eval_nvs()
     elif model_cfg.mode == "eval_pose":
         trainer.eval_pose()
+    elif model_cfg.mode == "extract_poses":
+        csv_path = os.path.join(data_path, "camera_poses.csv")
+        trainer.extract_camera_poses(csv_path)
     end_time = datetime.now()
     print('Duration: {}'.format(end_time - start_time))

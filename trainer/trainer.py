@@ -128,7 +128,16 @@ class GaussianTrainer(object):
         model = model.to(DEVICE).eval()
         self.depth_model = model
 
+    def save_depth_image(self, depth_tensor, save_path):
+        depth_min = depth_tensor.min()
+        depth_max = depth_tensor.max()
+        depth_normalized = (depth_tensor - depth_min) / (depth_max - depth_min) * 255.0
 
+        depth_image = depth_normalized.cpu().numpy().astype(np.uint8)
+        depth_image_pil = Image.fromarray(depth_image)
+
+        depth_image_pil.save(save_path)
+        
     def predict_depth(self, img):
         depth = self.depth_model.infer_image(img)
         depth_tensor = torch.from_numpy(depth).float()
@@ -178,6 +187,7 @@ class GaussianTrainer(object):
         return depth
 
     def setup_dataset(self):
+        self.image_names = []
         if self.model_cfg.data_type == "co3d":
             sequences = defaultdict(list)
             dataset = json.loads(gzip.GzipFile(os.path.join(self.data_root, self.category,
@@ -205,10 +215,13 @@ class GaussianTrainer(object):
                 print(test_image_names)
                 if "eval" in self.model_cfg.mode:
                     self.data = test_cam_infos
+                    self.image_names = test_image_names
                 else:
                     self.data = train_cam_infos
+                    self.image_names = train_image_names
             else:
                 self.data = seq_data
+                self.image_names = [c["image"]["path"] for c in seq_data]
             self.seq_len = len(self.data)
         elif self.model_cfg.data_type == "custom":
             source_path = self.model_cfg.source_path
@@ -267,8 +280,10 @@ class GaussianTrainer(object):
             self.i_train = np.array([i for i in ids if i not in self.i_test])
             if "eval" in self.model_cfg.mode:
                 self.data = [images[i] for i in self.i_test]
+                self.image_names = [os.path.basename(images[i]) for i in self.i_test]
             else:
                 self.data = [images[i] for i in self.i_train]
+                self.image_names = [os.path.basename(images[i]) for i in self.i_train]
             self.seq_len = len(self.data)
         else:
             source_path = self.model_cfg.source_path
@@ -292,12 +307,14 @@ class GaussianTrainer(object):
                 print("Test images: ", len(viewpoint_stack))
                 image_name = [c.image_name for c in viewpoint_stack]
                 print(image_name)
+                self.image_names = image_name
             else:
                 # viewpoint_stack = scene.getTrainCameras().copy()
                 viewpoint_stack = train_views
                 print("Train images: ", len(viewpoint_stack))
                 image_name = [c.image_name for c in viewpoint_stack]
                 print(image_name)
+                self.image_names = image_name
             self.data = viewpoint_stack
             self.seq_len = len(viewpoint_stack)
 
@@ -367,7 +384,7 @@ class GaussianTrainer(object):
             w, h = image.size
             depth_tensor = torch.ones((h, w))
             self.mono_depth[idx] = depth_tensor.cuda()
-
+        self.save_depth_image(depth_tensor, f"depth_image_{idx}.png")
         intr_mat_tensor = torch.from_numpy(
             intr_mat).float().to(depth_tensor.device)
         pts = depth_to_3d(depth_tensor[None, None],
@@ -466,6 +483,7 @@ class GaussianTrainer(object):
             depth_tensor = torch.ones((h, w))
             self.mono_depth[idx] = depth_tensor.cuda()
 
+        self.save_depth_image(depth_tensor, f"depth_image_{idx}.png")
         intr_mat_tensor = torch.from_numpy(
             intrinsics).float().to(depth_tensor.device)
         pts = depth_to_3d(depth_tensor[None, None],
@@ -502,6 +520,8 @@ class GaussianTrainer(object):
 
         original_image = Image.open(image_name).convert("RGB")
         width, height = original_image.size
+        self.image_width = width
+        self.image_height = height
         if min(width, height) > 1000:
             original_image = original_image.resize(
                 (width // 2, height // 2), Image.LANCZOS)
@@ -563,7 +583,6 @@ class GaussianTrainer(object):
         white_color = np.array([0.85, 0.85, 0.85])
         color_mask = np.all(image_np >= white_color, axis=-1)
 
-        
         points = points[~color_mask.flatten()]
         colors = image_np.reshape(-1, 3)[~color_mask.flatten()]
 
@@ -594,6 +613,7 @@ class GaussianTrainer(object):
                      orthogonal=True, learn_pose=False,
                      pose=None, load_depth=True,
                      load_gt=False):
+        print("*************************DATA TYPE ", self.data_type)
         if self.data_type == "co3d":
             return self.prepare_data_co3d(idx, down_sample=down_sample,
                                           orthogonal=orthogonal, learn_pose=learn_pose,
@@ -610,7 +630,7 @@ class GaussianTrainer(object):
                                                     pose=pose,
                                                     load_depth=load_depth)
 
-    def load_viewpoint_cam(self, idx, pose=None, load_depth=False):
+    def load_viewpoint_cam(self, idx, pose=None, load_depth=True):
         if self.data_type == "co3d":
             image_name = self.data[idx]["image"]["path"]
             image_path = os.path.join(self.data_root, image_name)
@@ -644,10 +664,18 @@ class GaussianTrainer(object):
             image_name = self.data[idx]
             original_image = Image.open(image_name).convert("RGB")
             width, height = original_image.size
+            self.image_width = width
+            self.image_height = height
+            intrinsics = self.intrinsic.copy()  # Make a copy of the intrinsics to modify if needed
             if min(width, height) > 1000:
                 original_image = original_image.resize(
                     (width // 2, height // 2), Image.LANCZOS)
                 width, height = original_image.size
+                # Scale intrinsics after resizing
+                intrinsics[0, 0] /= 2  # Scale focal length x
+                intrinsics[1, 1] /= 2  # Scale focal length y
+                intrinsics[0, 2] /= 2  # Scale principal point x (cx)
+                intrinsics[1, 2] /= 2  # Scale principal point y (cy)
             color_torch = torch.from_numpy(np.asarray(
                 original_image) / 255.0).permute(2, 0, 1).float()
             if pose is None:
@@ -662,7 +690,7 @@ class GaussianTrainer(object):
             FoVx = focal2fov(focal_length_x, width)
             viewpoint_camera = Camera(idx, R, t, FoVx, FoVy, color_torch,
                                     gt_alpha_mask=None, image_name=image_name,
-                                    intrinsics=self.intrinsic,
+                                    intrinsics=intrinsics,
                                     uid=idx, is_co3d=True)
             if load_depth:
                 if idx not in self.mono_depth:
