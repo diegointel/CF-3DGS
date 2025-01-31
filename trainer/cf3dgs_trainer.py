@@ -7,6 +7,7 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 import os
+import csv
 from tqdm import tqdm
 from random import randint
 import math
@@ -26,7 +27,9 @@ import imageio
 import glob
 import cv2
 import open3d as o3d
+import matplotlib.pyplot as plt
 
+from utils.sh_utils import eval_sh
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from gaussian_renderer import render
 from scene.gaussian_model_cf import CF3DGS_Render as GS_Render
@@ -66,9 +69,9 @@ class CFGaussianTrainer(GaussianTrainer):
         self.pipe_cfg = pipe_cfg
         self.optim_cfg = optim_cfg
 
-        self.gs_render = GS_Render(white_background=False,
+        self.gs_render = GS_Render(white_background=True,
                                    view_dependent=model_cfg.view_dependent,)
-        self.gs_render_local = GS_Render(white_background=False,
+        self.gs_render_local = GS_Render(white_background=True,
                                          view_dependent=model_cfg.view_dependent,)
         self.use_mask = self.pipe_cfg.use_mask
         self.use_mono = self.pipe_cfg.use_mono
@@ -169,7 +172,9 @@ class CFGaussianTrainer(GaussianTrainer):
                 gs_render.gaussians.camera_optimizer[current_fidx].zero_grad(
                     set_to_none=True)
 
-
+        # # Verify Gaussian Splatting Initialization
+        # print("Number of Gaussian Splatting:", self.gs_render.gaussians.get_xyz.shape[0])
+        # print("Gaussian Splatting Values:", self.gs_render.gaussians.get_xyz[:10])
         return loss_dict, render_pkg, psnr_train
 
     def init_two_view(self, view_idx_1, view_idx_2, pipe, optim_opt):
@@ -392,6 +397,37 @@ class CFGaussianTrainer(GaussianTrainer):
         pcd = BasicPointCloud(points, colors, normals)
         return pcd
 
+    def visualize_camera_poses(self, poses, save_path=None):
+        """
+        Visualize the camera poses in 3D.
+
+        Args:
+            poses (list of numpy.ndarray): List of camera poses (4x4 transformation matrices).
+            save_path (str, optional): Path to save the plot image. If None, the plot will be displayed interactively.
+        """
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection='3d')
+
+        for pose in poses:
+            # Extract the translation component of the pose
+            t = pose[:3, 3]
+            ax.scatter(t[0], t[1], t[2], c='r', marker='o')
+
+            # Plot the camera orientation as a line
+            R = pose[:3, :3]
+            camera_direction = R @ np.array([0, 0, 1])
+            ax.quiver(t[0], t[1], t[2], camera_direction[0], camera_direction[1], camera_direction[2], length=0.1, color='b')
+
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        ax.set_title('Camera Poses')
+
+        if save_path:
+            plt.savefig(save_path)
+        else:
+            plt.show()
+
     def train_from_progressive(self, ):
         pipe = copy(self.pipe_cfg)
         self.single_step = 500 # 300 for faster training; 500 for better results
@@ -417,6 +453,7 @@ class CFGaussianTrainer(GaussianTrainer):
 
         pose_dict = dict()
         poses_gt = []
+        print(self.data)
         for seq_data in self.data:
             if self.data_type == "co3d":
                 R, t, _, _, _ = self.load_camera(seq_data)
@@ -473,7 +510,7 @@ class CFGaussianTrainer(GaussianTrainer):
                     'Frames {:03d}/{:03d}, PSNR : {:.03f}'.format(fidx, self.seq_len-1, psnr_train))
                 self.visualize(render_dict,
                                 f"{result_path}/train/{self.global_iteration:06d}_{fidx:03d}.png",
-                                gt_image=gt_image, save_ply=False)
+                                gt_image=gt_image, save_ply=True, viewpoint_cam=viewpoint_cam)
 
             with torch.no_grad():
                 psnr_test = 0.0
@@ -496,7 +533,7 @@ class CFGaussianTrainer(GaussianTrainer):
                                         gt_image).mean().double()
                     self.visualize(render_dict,
                                     f"{result_path}/eval/ep{epoch:02d}_{self.global_iteration:06d}_{val_idx:03d}.png",
-                                    gt_image=gt_image, save_ply=False)
+                                    gt_image=gt_image, save_ply=True, viewpoint_cam=viewpoint_cam)
                 print('Number of {:03d} to {:03d} frames: PSNR : {:.03f}'.format(
                     start_frame,
                     end_frame,
@@ -514,8 +551,22 @@ class CFGaussianTrainer(GaussianTrainer):
             os.makedirs(f"{result_path}/chkpnt", exist_ok=True)
             torch.save(self.gs_render.gaussians.capture(),
                         f"{result_path}/chkpnt/ep{epoch:02d}_init.pth")
+            # Save poses to CSV files
+            pred_csv_path = os.path.join(result_path, "poses_pred.csv")
+            gt_csv_path = os.path.join(result_path, "poses_gt.csv")
+            self.extract_camera_poses(pred_csv_path, pose_dict["poses_pred"])
+            self.extract_camera_poses(gt_csv_path, pose_dict["poses_gt"])
 
 
+    def extract_camera_poses(self, csv_path, poses_pred):
+        with open(csv_path, mode='w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['Image ID', 'Camera Pose'])
+
+            for index, (pose, image_name) in enumerate(zip(poses_pred, self.image_names)):
+                writer.writerow([image_name] + pose.flatten().tolist())
+
+        print(f"Camera poses saved to {csv_path}")
 
     def eval_nvs(self, ):
         pipe = copy(self.pipe_cfg)
@@ -786,9 +837,10 @@ class CFGaussianTrainer(GaussianTrainer):
             kwargs['depth_pred'] = depth
 
         loss_dict = self.loss_func(image, gt_image, **kwargs)
+        # print("Loss Values:", loss_dict)
         return loss_dict
 
-    def visualize(self, render_pkg, filename, gt_image=None, gt_depth=None, save_ply=False):
+    def visualize(self, render_pkg, filename, gt_image=None, gt_depth=None, save_ply=False, viewpoint_cam=None):
         os.makedirs(os.path.dirname(filename), exist_ok=True)
         if "depth" in render_pkg:
             rend_depth = Image.fromarray(
@@ -820,12 +872,34 @@ class CFGaussianTrainer(GaussianTrainer):
         rend_img.save(filename)
 
         if save_ply:
+            shs_view = self.gs_render.gaussians.get_features.transpose(1, 2).view(
+                -1, 3, (self.gs_render.gaussians.max_sh_degree + 1) ** 2
+            )
+            fidx = viewpoint_cam.uid
+            camera_center = self.gs_render.gaussians.get_RT(fidx).inverse()[
+                :3, 3].detach()
+            camera_center = camera_center[None].repeat(
+                self.gs_render.gaussians.get_features.shape[0], 1)
+            dir_pp = self.gs_render.gaussians._xyz - camera_center
+            dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
+            sh2rgb = eval_sh(
+                self.gs_render.gaussians.active_sh_degree, shs_view, dir_pp_normalized
+            )
+            colors_t = torch.clamp_min(sh2rgb + 0.5, 0.0)
+            colors = colors_t.detach().cpu().numpy()
             points = self.gs_render.gaussians._xyz.detach().cpu().numpy()
+            # Save points to a .npy file
+            npy_filename = filename.replace('.png', '_points.npy')
+            np.save(npy_filename, points)
+
+            # Continue with the original code for saving the point cloud
             pcd_data = o3d.geometry.PointCloud()
             pcd_data.points = o3d.utility.Vector3dVector(points)
-            pcd_data.colors = o3d.utility.Vector3dVector(np.ones_like(points))
-            o3d.io.write_point_cloud(
-                filename.replace('.png', '.ply'), pcd_data)
+            pcd_data.colors = o3d.utility.Vector3dVector(colors)
+            o3d.io.write_point_cloud(filename.replace('.png', '.ply'), pcd_data)
+        # render_pkg = self.gs_render.render(viewpoint_cam, compute_cov3D_python=pipe.compute_cov3D_python, convert_SHs_python=pipe.convert_SHs_python)
+        # print("Visualization Parameters:", render_pkg)
+
 
     
     def construct_point(self, gs_model, poses, iteration, result_path, stop_frame=-1):
